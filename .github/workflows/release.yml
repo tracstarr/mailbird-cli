@@ -1,0 +1,42 @@
+name: release
+
+# Build the self-contained CLI, package the .skill, and publish a GitHub Release with it attached.
+# Trigger by pushing a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`),
+# or run manually from the Actions tab and supply a tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag/version to release (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # required to create the release and upload the asset
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build self-contained CLI and package .skill
+        shell: pwsh
+        run: ./build.ps1 -Package
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.event.inputs.tag }}'
+          if (-not $tag) { $tag = '${{ github.ref_name }}' }
+          Copy-Item dist/mailbird.skill "dist/mailbird-$tag.skill"
+          gh release create $tag "dist/mailbird-$tag.skill" --title "mailbird-cli $tag" --generate-notes

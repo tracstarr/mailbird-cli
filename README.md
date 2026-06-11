@@ -48,6 +48,19 @@ Or install it as a Claude Code skill (available in any session):
 Append `--json` to any read/search command for machine-readable output. Run the CLI with no
 arguments for full usage.
 
+## Releases
+
+Tagged releases include a prebuilt **`mailbird-<version>.skill`** bundle (the skill plus the compiled
+CLI) on the [Releases page](https://github.com/tracstarr/mailbird-cli/releases) — no build needed.
+It's a zip; extract it into your skills folder to install:
+
+```powershell
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[IO.Compression.ZipFile]::ExtractToDirectory("mailbird-v0.1.0.skill", "$HOME\.claude\skills")
+```
+
+Releases are produced automatically by CI when a `v*` tag is pushed (see `.github/workflows/release.yml`).
+
 ## Build from source
 
 Requires the **.NET 8 SDK**.
