@@ -2,12 +2,14 @@
 name: mailbird
 description: >-
   Work with the user's Mailbird desktop app (Windows) from this machine via one bundled CLI
-  (bin/mailbird-cli.exe). Two capabilities: (1) COMPOSE — open a pre-filled email draft for human
-  review before sending (mailto: handoff; never auto-sends; cannot set From/attachments/HTML);
-  (2) READ and SEARCH — query Mailbird's local Store.db read-only to full-text search mail, list
-  folders and recent messages, and read a message's headers plus body. Use whenever the user wants
-  to draft, compose, write, or reply to an email via Mailbird, OR to find, search, look up, read,
-  or summarize existing emails in their Mailbird mailboxes.
+  (bin/mailbird-cli.exe). Three capabilities: (1) DRAFT — create a real draft via the account's
+  provider (Gmail API / Outlook IMAP) using Mailbird's own OAuth token, so it syncs into Mailbird's
+  Drafts with the chosen From account and, for replies, attached to the correct thread (never sends);
+  (2) COMPOSE — open a pre-filled compose window for human review (mailto: handoff; cannot set
+  From/attachments/HTML); (3) READ and SEARCH — query Mailbird's local Store.db read-only to
+  full-text search mail, list folders and recent messages, and read a message's headers plus body.
+  Use whenever the user wants to draft, compose, write, or reply to an email via Mailbird, OR to
+  find, search, look up, read, or summarize existing emails in their Mailbird mailboxes.
 ---
 
 # Mailbird (compose + read/search)
@@ -59,7 +61,36 @@ Second paragraph.
 
 ---
 
-## Capability 2 — Read & search mail (read-only)
+## Capability 2 — Create a draft via the provider API (recommended; sets account + threads replies)
+
+Creates a **real draft on the mail server** using the OAuth token Mailbird already holds for that account
+(Gmail REST API for Google accounts; IMAP `APPEND` for Outlook/Hotmail). The draft then syncs **into**
+Mailbird's Drafts folder on the next poll. Unlike `compose`, this **picks the From account**, supports
+**HTML**, and **attaches replies to the correct thread**. It **never sends** — only saves a draft.
+
+```powershell
+# New draft from a specific account
+& $cli draft --account 1 --to "recipient@example.com" --subject "Subject" --body "Plain-text body."
+
+# Reply that attaches to an existing thread — infers the account, thread, Re: subject, and recipient
+& $cli draft --reply-to 112187 --body "Thanks — that works for me."
+```
+
+- Find the message id to reply to via `search`/`list`/`read` (the `Id` column), then pass it as `--reply-to`.
+- Options: `--account ID` (required unless `--reply-to` supplies it), `--to` (comma-separated), `--subject`,
+  `--body` / `--body-file`, `--cc`, `--bcc`, `--reply-to <messageId>`, `--html` (treat body as HTML),
+  `--dry-run` (print what it would do, create nothing), `--json`.
+- On a reply: the account is inherited from the parent (a thread is account-specific), the subject becomes
+  `Re: <original>`, and `--to` defaults to the original sender — override any of these explicitly.
+- Requires an **OAuth Google or Microsoft account** (it reads the token read-only from Store.db; password
+  accounts aren't supported). Keep Mailbird running so the token stays fresh. The draft appears in Mailbird,
+  correctly threaded, after the next sync (seconds to a couple of minutes).
+- Tell the user: draft only (they review and click Send); it's created server-side and syncs in. Don't
+  invent recipients — ask if unknown.
+
+---
+
+## Capability 3 — Read & search mail (read-only)
 
 The CLI opens `Store.db` with `Mode=ReadOnly` and never writes.
 

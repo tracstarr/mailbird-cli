@@ -4,7 +4,14 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
+using MailKit;
+using MailKit.Net.Imap;
+using MailKit.Security;
+using MimeKit;
 using Microsoft.Data.Sqlite;
 
 // mailbird-cli — one tool for the local Mailbird:
@@ -139,6 +146,9 @@ internal static class Program
                 break;
             }
 
+            case "draft":
+                return Draft(con, opt, pos);
+
             case "tables":
                 Query(con, "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY name");
                 break;
@@ -246,6 +256,261 @@ internal static class Program
         }
     }
 
+    // ---- draft: create a server-side draft via the account's provider, so it syncs INTO Mailbird ----
+    // Reads the OAuth token from Store.db (read-only); routes Google -> Gmail REST drafts.create,
+    // Microsoft -> IMAP APPEND to Drafts (XOAUTH2). Supports replies that attach to the right thread.
+    sealed class Parent
+    {
+        public int AccountId; public string ThreadId; public string MailMessageId; public string Subject;
+        public List<string> References = new List<string>(); public string ReplyToEmail;
+    }
+    sealed class Cred
+    { public string Token; public DateTime Expires; public string Scope; public string Host; public string Username; }
+
+    static int Draft(SqliteConnection con, Dictionary<string, string> opt, List<string> pos)
+    {
+        long? replyTo = null;
+        if (opt.TryGetValue("reply-to", out var rt))
+        {
+            if (!long.TryParse(rt, out var rv)) { Console.Error.WriteLine("--reply-to needs a numeric messageId"); return 1; }
+            replyTo = rv;
+        }
+        Parent parent = replyTo.HasValue ? LoadParent(con, replyTo.Value) : null;
+        if (replyTo.HasValue && parent == null) { Console.Error.WriteLine($"reply-to message {replyTo} not found"); return 1; }
+
+        int accountId;
+        if (opt.TryGetValue("account", out var ac))
+        {
+            if (!int.TryParse(ac, out accountId)) { Console.Error.WriteLine("--account needs a numeric id"); return 1; }
+        }
+        else if (parent != null) accountId = parent.AccountId;
+        else { Console.Error.WriteLine("draft needs --account <id> (or --reply-to <messageId> to inherit it)"); return 1; }
+
+        if (parent != null && parent.AccountId != accountId)
+        { Console.Error.WriteLine($"reply must use the parent's account ({parent.AccountId}); a thread is account-specific"); return 1; }
+
+        var (fromEmail, fromName) = ResolveSender(con, accountId);
+        if (fromEmail == null) { Console.Error.WriteLine($"account {accountId} not found"); return 2; }
+
+        var cred = ResolveCred(con, accountId);
+        if (cred == null) { Console.Error.WriteLine($"account {accountId} has no OAuth credential (only OAuth Google/Microsoft accounts are supported)"); return 2; }
+        if (string.IsNullOrEmpty(cred.Token)) { Console.Error.WriteLine($"account {accountId}: no access token stored — open/keep Mailbird running so it refreshes the token."); return 2; }
+        bool google = (cred.Scope ?? "").Contains("mail.google.com") || (cred.Host ?? "").Contains("gmail");
+        bool microsoft = (cred.Scope ?? "").Contains("outlook.office.com") || (cred.Host ?? "").Contains("office365") || (cred.Host ?? "").Contains("outlook");
+        if (!google && !microsoft) { Console.Error.WriteLine($"account {accountId}: unrecognized provider (host {cred.Host})"); return 4; }
+
+        var toList = SplitAddrs(opt.GetValueOrDefault("to") ?? string.Join(",", pos));
+        if (toList.Count == 0 && parent?.ReplyToEmail != null) toList.Add(parent.ReplyToEmail);
+        if (toList.Count == 0) { Console.Error.WriteLine("draft needs --to <addr[,addr]> (or a --reply-to whose sender becomes the recipient)"); return 1; }
+        var ccList = SplitAddrs(opt.GetValueOrDefault("cc"));
+        var bccList = SplitAddrs(opt.GetValueOrDefault("bcc"));
+
+        string subject = opt.GetValueOrDefault("subject");
+        if (subject == null && parent != null) subject = EnsureRe(parent.Subject);
+        subject ??= "";
+
+        string body = opt.GetValueOrDefault("body", "");
+        if (opt.TryGetValue("body-file", out var bf))
+        {
+            if (!File.Exists(bf)) { Console.Error.WriteLine($"body-file not found: {bf}"); return 1; }
+            body = File.ReadAllText(bf);
+        }
+        bool html = opt.ContainsKey("html");
+
+        var msg = new MimeMessage();
+        msg.From.Add(new MailboxAddress(fromName ?? "", fromEmail));
+        try
+        {
+            foreach (var t in toList) msg.To.Add(MailboxAddress.Parse(t));
+            foreach (var c in ccList) msg.Cc.Add(MailboxAddress.Parse(c));
+            foreach (var b in bccList) msg.Bcc.Add(MailboxAddress.Parse(b));
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"bad address: {ex.Message}"); return 1; }
+        msg.Subject = subject;
+        string domain = fromEmail.Contains('@') ? fromEmail.Substring(fromEmail.IndexOf('@') + 1) : "mailbird.local";
+        msg.MessageId = $"Mailbird-{Guid.NewGuid()}@{domain}";
+        if (parent != null && !string.IsNullOrEmpty(parent.MailMessageId))
+        {
+            string pid = parent.MailMessageId.Trim('<', '>', ' ');
+            msg.InReplyTo = pid;
+            foreach (var r in parent.References) { var rr = r.Trim('<', '>', ' '); if (rr.Length > 0) msg.References.Add(rr); }
+            if (!msg.References.Contains(pid)) msg.References.Add(pid);
+        }
+        var bb = new BodyBuilder();
+        if (html) bb.HtmlBody = body; else bb.TextBody = body;
+        msg.Body = bb.ToMessageBody();
+
+        string provider = google ? "google" : "microsoft";
+        Console.WriteLine($"Account : {accountId} <{fromEmail}>  [{provider}]");
+        Console.WriteLine($"To      : {string.Join(", ", toList)}");
+        if (ccList.Count > 0) Console.WriteLine($"Cc      : {string.Join(", ", ccList)}");
+        Console.WriteLine($"Subject : {subject}");
+        if (parent != null) Console.WriteLine($"Reply   : msg {replyTo} (thread {(parent.ThreadId ?? "via In-Reply-To/References")})");
+
+        if (opt.ContainsKey("dry-run")) { Console.WriteLine("[dry-run] nothing created."); return 0; }
+        if (cred.Expires != default && cred.Expires < DateTime.UtcNow)
+            Console.Error.WriteLine("warning: the stored access token looks expired; keep Mailbird running so it refreshes the token.");
+
+        try
+        {
+            return google
+                ? GmailCreate(cred.Token, msg, ToGmailThreadId(parent?.ThreadId))
+                : ImapAppend(cred.Token, cred.Host, cred.Username ?? fromEmail, msg);
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"draft creation failed: {ex.Message}"); return 5; }
+    }
+
+    static Parent LoadParent(SqliteConnection con, long id)
+    {
+        var p = new Parent();
+        using (var c = con.CreateCommand())
+        {
+            c.CommandText = "SELECT AccountId, ThreadId, MailMessageId, Subject FROM Messages WHERE Id=$id";
+            c.Parameters.AddWithValue("$id", id);
+            using var r = c.ExecuteReader();
+            if (!r.Read()) return null;
+            p.AccountId = Convert.ToInt32(r["AccountId"]);
+            p.ThreadId = r["ThreadId"] as string;
+            p.MailMessageId = r["MailMessageId"] as string;
+            p.Subject = r["Subject"] as string ?? "";
+        }
+        using (var c = con.CreateCommand())
+        {
+            c.CommandText = "SELECT MailMessageId FROM MessageReferences WHERE MessageId=$id ORDER BY Id";
+            c.Parameters.AddWithValue("$id", id);
+            using var r = c.ExecuteReader();
+            while (r.Read()) { var s = r.GetValue(0) as string; if (!string.IsNullOrEmpty(s)) p.References.Add(s); }
+        }
+        using (var c = con.CreateCommand())
+        {
+            // Prefer Reply-To (Type 1) over From (Type 0) as the reply recipient.
+            c.CommandText = "SELECT Email FROM Messages_Contacts WHERE MessageId=$id AND Type IN (0,1) ORDER BY Type DESC LIMIT 1";
+            c.Parameters.AddWithValue("$id", id);
+            p.ReplyToEmail = c.ExecuteScalar() as string;
+        }
+        return p;
+    }
+
+    static (string, string) ResolveSender(SqliteConnection con, int accountId)
+    {
+        using var c = con.CreateCommand();
+        c.CommandText = @"SELECT COALESCE(si.Email, a.Username) AS Email, si.Name
+                          FROM Accounts a
+                          LEFT JOIN SenderIdentities si ON si.Id = COALESCE(a.PrimarySenderIdentityId, a.DefaultSenderIdentityId)
+                          WHERE a.Id=$a";
+        c.Parameters.AddWithValue("$a", accountId);
+        using var r = c.ExecuteReader();
+        if (!r.Read()) return (null, null);
+        return (r["Email"] as string, r["Name"] as string);
+    }
+
+    static Cred ResolveCred(SqliteConnection con, int accountId)
+    {
+        using var c = con.CreateCommand();
+        c.CommandText = @"SELECT o.AccessToken, o.AccessTokenExpiresAt_UTC, o.ProviderScope, a.Server_Host, a.Username
+                          FROM Accounts a JOIN OAuth2Credentials o ON o.Id = a.OAuth2CredentialsId WHERE a.Id=$a";
+        c.Parameters.AddWithValue("$a", accountId);
+        using var r = c.ExecuteReader();
+        if (!r.Read()) return null;
+        DateTime.TryParse(r["AccessTokenExpiresAt_UTC"] as string, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out var exp);
+        return new Cred
+        {
+            Token = r["AccessToken"] as string,
+            Expires = exp,
+            Scope = r["ProviderScope"] as string,
+            Host = r["Server_Host"] as string,
+            Username = r["Username"] as string,
+        };
+    }
+
+    static string EnsureRe(string s)
+    {
+        s ??= "";
+        return s.TrimStart().StartsWith("re:", StringComparison.OrdinalIgnoreCase) ? s : "Re: " + s;
+    }
+
+    // Mailbird stores Gmail's threadId as a decimal Int64; the Gmail REST API expects it in hex.
+    static string ToGmailThreadId(string stored)
+        => string.IsNullOrEmpty(stored) ? stored
+           : (ulong.TryParse(stored, out var v) ? v.ToString("x") : stored);
+
+    static int GmailCreate(string token, MimeMessage msg, string threadId)
+    {
+        var fo = FormatOptions.Default.Clone();
+        fo.NewLineFormat = NewLineFormat.Dos;   // RFC-compliant CRLF
+        byte[] mime;
+        using (var ms = new MemoryStream()) { msg.WriteTo(fo, ms); mime = ms.ToArray(); }
+        string raw = Convert.ToBase64String(mime).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+
+        (System.Net.HttpStatusCode status, string body) Post(string thread)
+        {
+            object payload = string.IsNullOrEmpty(thread)
+                ? new { message = new { raw } }
+                : new { message = new { raw, threadId = thread } };
+            using var http = new HttpClient();
+            var req = new HttpRequestMessage(HttpMethod.Post, "https://gmail.googleapis.com/gmail/v1/users/me/drafts")
+            { Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json") };
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            using var resp = http.Send(req);
+            using var sr = new StreamReader(resp.Content.ReadAsStream());
+            return (resp.StatusCode, sr.ReadToEnd());
+        }
+
+        var (status, body) = Post(threadId);
+        // Only a 400 means the threadId/subject didn't match the thread — retry unthreaded.
+        // Auth (401/403) and server (5xx) errors are surfaced as-is, not misreported as a thread problem.
+        if (status == System.Net.HttpStatusCode.BadRequest && !string.IsNullOrEmpty(threadId))
+        {
+            Console.Error.WriteLine("note: Gmail rejected the threadId (subject/reference mismatch); creating an unthreaded draft instead.");
+            (status, body) = Post(null);
+        }
+        if ((int)status < 200 || (int)status >= 300)
+            throw new InvalidOperationException($"Gmail API HTTP {(int)status}: {body}");
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        string draftId = root.GetProperty("id").GetString();
+        var m = root.GetProperty("message");
+        string msgId = m.GetProperty("id").GetString();
+        string thr = m.TryGetProperty("threadId", out var te) ? te.GetString() : null;
+        if (Json)
+            Console.WriteLine(JsonSerializer.Serialize(new { ok = true, provider = "google", draftId, messageId = msgId, threadId = thr }));
+        else
+        {
+            Console.WriteLine($"Created Gmail draft {draftId} (thread {thr}).");
+            Console.WriteLine("It will sync into Mailbird's Drafts folder on the next poll.");
+        }
+        return 0;
+    }
+
+    static int ImapAppend(string token, string host, string user, MimeMessage msg)
+    {
+        using var client = new ImapClient();
+        client.Connect(host, 993, SecureSocketOptions.SslOnConnect);
+        client.Authenticate(new SaslMechanismOAuth2(user, token));
+        IMailFolder drafts = null;
+        try { drafts = client.GetFolder(SpecialFolder.Drafts); } catch { /* Outlook IMAP lacks SPECIAL-USE/XLIST */ }
+        if (drafts == null)
+        {
+            var personal = client.GetFolder(client.PersonalNamespaces[0]);
+            foreach (var f in personal.GetSubfolders(false))
+                if (string.Equals(f.Name, "Drafts", StringComparison.OrdinalIgnoreCase)) { drafts = f; break; }
+        }
+        if (drafts == null) { client.Disconnect(true); Console.Error.WriteLine("could not locate the Drafts folder over IMAP"); return 5; }
+        drafts.Open(FolderAccess.ReadWrite);
+        var uid = drafts.Append(msg, MessageFlags.Draft | MessageFlags.Seen);
+        string folder = drafts.FullName;
+        client.Disconnect(true);
+        if (Json)
+            Console.WriteLine(JsonSerializer.Serialize(new { ok = true, provider = "microsoft", folder, appendUid = uid.HasValue ? (object)uid.Value.Id : null, messageId = msg.MessageId }));
+        else
+        {
+            Console.WriteLine($"Appended draft to {folder} (uid {(uid.HasValue ? uid.Value.ToString() : "n/a")}).");
+            Console.WriteLine("It will sync into Mailbird's Drafts folder on the next poll.");
+        }
+        return 0;
+    }
+
     // ---- generic helpers ----
     static void Query(SqliteConnection con, string sql, Dictionary<string, object> ps = null)
     {
@@ -322,6 +587,8 @@ internal static class Program
 USAGE
   mailbird-cli compose --to <addr[,addr]> [--subject S] [--body B | --body-file F]
                        [--cc ..] [--bcc ..] [--dry-run] [--use-default-handler] [--mailbird-path EXE]
+  mailbird-cli [<db>] draft [--account ID] --to <addr[,addr]> [--subject S] [--body B | --body-file F]
+                       [--reply-to <messageId>] [--cc ..] [--bcc ..] [--html] [--dry-run] [--json]
   mailbird-cli [<db>] accounts
   mailbird-cli [<db>] folders [accountId]
   mailbird-cli [<db>] search <query...> [--account ID] [--limit N] [--raw]
@@ -331,11 +598,16 @@ USAGE
   (append --json to any read/search command for machine-readable output)
 
   compose opens a DRAFT only and never sends; From is Mailbird's default account; body is plain text.
+  draft creates a server-side draft via the account's provider (Gmail API / Outlook IMAP) using the OAuth
+       token Mailbird already holds, so it syncs back INTO Mailbird's Drafts. Picks the From account and,
+       with --reply-to, attaches to that message's thread. Never sends. (Reads the DB read-only.)
   <db> is optional; defaults to %LOCALAPPDATA%\Mailbird\Store\Store.db (override with MAILBIRD_STORE_DB).
   Read/search open the DB read-only and never write to it.
 
 EXAMPLES
   mailbird-cli compose --to you@example.com --subject ""Hi"" --body ""Hello there""
+  mailbird-cli draft --account 1 --to you@example.com --subject ""Hi"" --body ""Hello there""
+  mailbird-cli draft --reply-to 112187 --body ""Thanks — sounds good.""   (reply in the parent's account+thread)
   mailbird-cli search ""invoice overdue"" --limit 10
   mailbird-cli list --folder Inbox --account 4 --unread --limit 20
   mailbird-cli read 112097
