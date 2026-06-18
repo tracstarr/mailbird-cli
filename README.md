@@ -38,7 +38,7 @@ Or install it as a Claude Code skill (available in any session):
 
 | Command | Description |
 |---|---|
-| `compose --to A --subject S --body B` | Open a pre-filled draft for review (`--cc` `--bcc` `--body-file` `--dry-run`). |
+| `compose --to A --subject S --body B` | Open a pre-filled draft for review (`--cc` `--bcc` `--body-file` `--signature` `--dry-run`). |
 | `search <query> [--account ID] [--limit N] [--raw]` | Full-text search (subject/body/from/to). |
 | `list [--folder NAME] [--account ID] [--from SUBSTR] [--unread] [--days N] [--limit N]` | Recent messages. |
 | `read <messageId> [--max CHARS]` | One message: headers + body text. |

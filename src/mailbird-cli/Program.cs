@@ -4,10 +4,12 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using MailKit;
 using MailKit.Net.Imap;
 using MailKit.Security;
@@ -33,6 +35,11 @@ internal static class Program
     }
 
     static bool Json;   // when set, tabular modes emit a JSON array instead of pipe-delimited text
+
+    // Optional signature appended to the end of a draft/compose body (after a blank line) when one is
+    // requested via --signature "..." or the MAILBIRD_SIGNATURE env var. Empty = no signature by default
+    // (Mailbird applies the account's own signature on send, so adding one here would duplicate it).
+    const string DefaultSignature = "";
 
     static int Main(string[] argv)
     {
@@ -179,6 +186,8 @@ internal static class Program
             if (!File.Exists(bf)) { Console.Error.WriteLine($"body-file not found: {bf}"); return 1; }
             body = File.ReadAllText(bf);
         }
+        // mailto: is plain text only — keep the author's line breaks and append the signature after a blank line.
+        body = AppendSignatureText(NormalizeNewlines(body), ResolveSignature(opt));
         var ccList = SplitAddrs(opt.GetValueOrDefault("cc"));
         var bccList = SplitAddrs(opt.GetValueOrDefault("bcc"));
         bool dry = opt.ContainsKey("dry-run");
@@ -223,6 +232,65 @@ internal static class Program
         => string.IsNullOrWhiteSpace(csv)
             ? new List<string>()
             : csv.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
+
+    // ---- body formatting & signature ----
+
+    static string NormalizeNewlines(string s)
+        => (s ?? "").Replace("\r\n", "\n").Replace("\r", "\n");
+
+    // The signature to append, or null if disabled. Precedence: --no-signature > --signature >
+    // MAILBIRD_SIGNATURE env var > DefaultSignature. A literal "\n" in the value is treated as a
+    // real newline so multi-line signatures survive shell quoting.
+    static string ResolveSignature(Dictionary<string, string> opt)
+    {
+        if (opt.ContainsKey("no-signature")) return null;
+        string sig = opt.TryGetValue("signature", out var s)
+            ? s
+            : Environment.GetEnvironmentVariable("MAILBIRD_SIGNATURE") ?? DefaultSignature;
+        sig = NormalizeNewlines(sig).Replace("\\n", "\n").Trim('\n');
+        return string.IsNullOrWhiteSpace(sig) ? null : sig;
+    }
+
+    // Append a plain-text signature after a blank line (the standard "newline then signature" layout).
+    static string AppendSignatureText(string body, string signature)
+    {
+        body = NormalizeNewlines(body).Trim('\n');
+        if (string.IsNullOrEmpty(signature)) return body;
+        return body.Length > 0 ? body + "\n\n" + signature : signature;
+    }
+
+    // Append a signature to an already-HTML body as its own spaced block.
+    static string AppendSignatureHtml(string html, string signature)
+    {
+        if (string.IsNullOrEmpty(signature)) return html;
+        var lines = NormalizeNewlines(signature).Split('\n').Select(WebUtility.HtmlEncode);
+        return html + "<p style=\"margin:1em 0 0\">" + string.Join("<br>", lines) + "</p>";
+    }
+
+    // Turn a plain-text body into a (text, html) pair with real paragraph spacing: blank lines
+    // separate <p> paragraphs and single newlines become <br>. The signature, if any, is appended
+    // after a blank line in both forms. Without this, a plain-text body renders as one run-on block.
+    static (string text, string html) BuildFormattedBody(string body, string signature)
+    {
+        string text = AppendSignatureText(body, signature);
+
+        var html = new StringBuilder();
+        foreach (var block in Regex.Split(NormalizeNewlines(body).Trim('\n'), @"\n[ \t]*\n"))
+        {
+            var joined = string.Join("<br>",
+                block.Split('\n').Select(l => WebUtility.HtmlEncode(l.TrimEnd()))).Trim();
+            if (joined.Length > 0) html.Append("<p style=\"margin:0 0 1em\">").Append(joined).Append("</p>");
+        }
+        if (!string.IsNullOrEmpty(signature))
+        {
+            var lines = NormalizeNewlines(signature).Split('\n').Select(WebUtility.HtmlEncode);
+            html.Append("<p style=\"margin:0 0 1em\">").Append(string.Join("<br>", lines)).Append("</p>");
+        }
+
+        string doc = "<div style=\"font-family:Calibri,Arial,sans-serif;font-size:11pt;line-height:1.4\">"
+                   + html + "</div>";
+        return (text, doc);
+    }
 
     static void ReadMessage(SqliteConnection con, long id, int maxBody)
     {
@@ -316,6 +384,7 @@ internal static class Program
             body = File.ReadAllText(bf);
         }
         bool html = opt.ContainsKey("html");
+        string signature = ResolveSignature(opt);
 
         var msg = new MimeMessage();
         msg.From.Add(new MailboxAddress(fromName ?? "", fromEmail));
@@ -337,7 +406,19 @@ internal static class Program
             if (!msg.References.Contains(pid)) msg.References.Add(pid);
         }
         var bb = new BodyBuilder();
-        if (html) bb.HtmlBody = body; else bb.TextBody = body;
+        if (html)
+        {
+            // Body is already HTML — append the signature as its own block, keep it HTML-only.
+            bb.HtmlBody = AppendSignatureHtml(body, signature);
+        }
+        else
+        {
+            // Plain-text input: send multipart/alternative so the draft renders with real paragraph
+            // spacing (HTML) while staying readable in text-only clients. Fixes run-on, one-line bodies.
+            var (textBody, htmlBody) = BuildFormattedBody(body, signature);
+            bb.TextBody = textBody;
+            bb.HtmlBody = htmlBody;
+        }
         msg.Body = bb.ToMessageBody();
 
         string provider = google ? "google" : "microsoft";
@@ -586,9 +667,11 @@ internal static class Program
 
 USAGE
   mailbird-cli compose --to <addr[,addr]> [--subject S] [--body B | --body-file F]
-                       [--cc ..] [--bcc ..] [--dry-run] [--use-default-handler] [--mailbird-path EXE]
+                       [--cc ..] [--bcc ..] [--signature S | --no-signature]
+                       [--dry-run] [--use-default-handler] [--mailbird-path EXE]
   mailbird-cli [<db>] draft [--account ID] --to <addr[,addr]> [--subject S] [--body B | --body-file F]
-                       [--reply-to <messageId>] [--cc ..] [--bcc ..] [--html] [--dry-run] [--json]
+                       [--reply-to <messageId>] [--cc ..] [--bcc ..] [--html]
+                       [--signature S | --no-signature] [--dry-run] [--json]
   mailbird-cli [<db>] accounts
   mailbird-cli [<db>] folders [accountId]
   mailbird-cli [<db>] search <query...> [--account ID] [--limit N] [--raw]
@@ -601,6 +684,10 @@ USAGE
   draft creates a server-side draft via the account's provider (Gmail API / Outlook IMAP) using the OAuth
        token Mailbird already holds, so it syncs back INTO Mailbird's Drafts. Picks the From account and,
        with --reply-to, attaches to that message's thread. Never sends. (Reads the DB read-only.)
+       A plain-text body is sent as multipart/alternative with proper paragraph spacing (blank lines =
+       paragraphs, single newlines = line breaks); pass --html if the body is already HTML.
+  signature: optional, off by default. When set via --signature ""..."" (use \n for line breaks) or the
+       MAILBIRD_SIGNATURE env var, it is appended after a blank line at the end of the body.
   <db> is optional; defaults to %LOCALAPPDATA%\Mailbird\Store\Store.db (override with MAILBIRD_STORE_DB).
   Read/search open the DB read-only and never write to it.
 

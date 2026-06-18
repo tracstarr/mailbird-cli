@@ -54,10 +54,12 @@ Second paragraph.
 ```
 
 - Options: `--to` (required; comma-separated), `--subject`, `--body` / `--body-file`, `--cc`, `--bcc`,
-  `--dry-run` (print the mailto URL, open nothing).
+  `--signature "..."` / `--no-signature`, `--dry-run` (print the mailto URL, open nothing).
 - Tell the user: draft only (they click Send); From = Mailbird's default account (not selectable —
   switchable in the composer); plain-text body, no HTML, no attachments.
-- Generate a concise subject + clean plain-text body. Don't invent recipients — ask if unknown.
+- Generate a concise subject + clean plain-text body with paragraphs separated by blank lines. No
+  signature is added by default; pass `--signature "..."` only if the user asks for one. Don't invent
+  recipients — ask if unknown.
 
 ---
 
@@ -79,7 +81,15 @@ Mailbird's Drafts folder on the next poll. Unlike `compose`, this **picks the Fr
 - Find the message id to reply to via `search`/`list`/`read` (the `Id` column), then pass it as `--reply-to`.
 - Options: `--account ID` (required unless `--reply-to` supplies it), `--to` (comma-separated), `--subject`,
   `--body` / `--body-file`, `--cc`, `--bcc`, `--reply-to <messageId>`, `--html` (treat body as HTML),
-  `--dry-run` (print what it would do, create nothing), `--json`.
+  `--signature "..."` / `--no-signature`, `--dry-run` (print what it would do, create nothing), `--json`.
+- **Formatting:** a plain-text body is sent as multipart/alternative with real paragraph spacing — separate
+  paragraphs with a **blank line**, and use single newlines for line breaks within a paragraph. So write the
+  body with proper structure (greeting, paragraphs, closing) rather than one run-on line. Pass `--html` only
+  if you're supplying HTML yourself.
+- **Signature:** none is added by default (Mailbird applies the account's own signature on send, so a
+  draft-body signature would duplicate it). If the user explicitly wants one in the draft body, pass
+  `--signature "Name\nTitle"` (use `\n` for line breaks) or set the `MAILBIRD_SIGNATURE` env var; when set,
+  it is appended after a blank line at the end (including on replies). Don't also type it into the body.
 - On a reply: the account is inherited from the parent (a thread is account-specific), the subject becomes
   `Re: <original>`, and `--to` defaults to the original sender — override any of these explicitly.
 - Requires an **OAuth Google or Microsoft account** (it reads the token read-only from Store.db; password
