@@ -60,6 +60,9 @@ Second paragraph.
 - Generate a concise subject + clean plain-text body with paragraphs separated by blank lines. No
   signature is added by default; pass `--signature "..."` only if the user asks for one. Don't invent
   recipients — ask if unknown.
+- Match the **user's own writing voice** if a writing-style profile is available in memory
+  (`mailbird-writing-style`, produced by the `email-style-analysis` skill): use their greeting,
+  sign-off, brevity, and register for that recipient type.
 
 ---
 
@@ -86,6 +89,10 @@ Mailbird's Drafts folder on the next poll. Unlike `compose`, this **picks the Fr
   paragraphs with a **blank line**, and use single newlines for line breaks within a paragraph. So write the
   body with proper structure (greeting, paragraphs, closing) rather than one run-on line. Pass `--html` only
   if you're supplying HTML yourself.
+- **Voice:** write the body in the **user's own email style** if a writing-style profile is available in
+  memory (`mailbird-writing-style`, produced by the `email-style-analysis` skill). Match their greeting,
+  sign-off, brevity, pet phrases, and the register they'd use for that recipient. Capture their rhythm and
+  phrasing — but keep the draft clean (don't reproduce typos); they review before sending.
 - **Signature:** none is added by default (Mailbird applies the account's own signature on send, so a
   draft-body signature would duplicate it). If the user explicitly wants one in the draft body, pass
   `--signature "Name\nTitle"` (use `\n` for line breaks) or set the `MAILBIRD_SIGNATURE` env var; when set,
