@@ -101,9 +101,35 @@ Mailbird's Drafts folder on the next poll. Unlike `compose`, this **picks the Fr
   `Re: <original>`, and `--to` defaults to the original sender — override any of these explicitly.
 - Requires an **OAuth Google or Microsoft account** (it reads the token read-only from Store.db; password
   accounts aren't supported). Keep Mailbird running so the token stays fresh. The draft appears in Mailbird,
-  correctly threaded, after the next sync (seconds to a couple of minutes).
+  correctly threaded, after the next sync (seconds to a couple of minutes; an account that isn't the one
+  in active view in Mailbird may take noticeably longer to poll its Drafts folder).
 - Tell the user: draft only (they review and click Send); it's created server-side and syncs in. Don't
   invent recipients — ask if unknown.
+
+### Track and revise drafts: `draft list` / `draft edit` / `draft delete`
+
+Once a draft has synced into Mailbird you can list, edit, or delete it **by its local message Id** — the
+same `Id` shown by `search`/`list`/`read`. The CLI resolves that Id back to the provider's draft (Gmail
+`drafts.update`/`drafts.delete`; Outlook via the IMAP UID) and operates on it server-side, so the change
+syncs back into Mailbird. **Never sends.**
+
+```powershell
+& $cli draft list                                  # drafts that have synced into Mailbird (Id, account, subject, to)
+& $cli draft list --account 1                       # scope to one account
+& $cli draft edit 112465 --body "Revised text."     # rewrite the body in place (keeps to/subject/thread)
+& $cli draft edit 112465 --subject "New subject"    # change just the subject; body/recipients unchanged
+& $cli draft delete 112465                           # remove the draft (server-side; Mailbird drops it on next poll)
+```
+
+- `draft edit <Id>` revises **in place** (Gmail keeps the same draft; Outlook appends the new version and
+  removes the old over IMAP). Any field you don't pass keeps its current value — `--subject`, `--to`,
+  `--cc`, `--bcc`, `--body`/`--body-file`, `--html`, `--signature`/`--no-signature` all override.
+  If you omit `--body`, it reuses the draft's existing text (HTML formatting may simplify), so for a real
+  body change always pass the new `--body`. Reply threading is preserved.
+- `draft delete <Id>` only acts on actual drafts (it refuses any non-draft message). `--dry-run` on either
+  shows what it would do without changing anything; add `--json` for machine-readable output.
+- Both need the draft to have **synced into Mailbird first** (so it has a local Id and a provider handle).
+  A brand-new draft that hasn't appeared in Mailbird yet has no Id to target — wait for it to sync.
 
 ---
 

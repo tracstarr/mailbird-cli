@@ -154,7 +154,15 @@ internal static class Program
             }
 
             case "draft":
+            {
+                // Subcommands: `draft list|edit|delete`. Anything else is the create path (default),
+                // where the first positional is a recipient, not a verb.
+                string sub = pos.Count > 0 ? pos[0].ToLowerInvariant() : "";
+                if (sub is "list" or "ls") return DraftList(con, opt, pos.Skip(1).ToList());
+                if (sub is "edit" or "update") return DraftEdit(con, opt, pos.Skip(1).ToList());
+                if (sub is "delete" or "rm" or "remove") return DraftDelete(con, opt, pos.Skip(1).ToList());
                 return Draft(con, opt, pos);
+            }
 
             case "tables":
                 Query(con, "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY name");
@@ -386,40 +394,12 @@ internal static class Program
         bool html = opt.ContainsKey("html");
         string signature = ResolveSignature(opt);
 
-        var msg = new MimeMessage();
-        msg.From.Add(new MailboxAddress(fromName ?? "", fromEmail));
-        try
-        {
-            foreach (var t in toList) msg.To.Add(MailboxAddress.Parse(t));
-            foreach (var c in ccList) msg.Cc.Add(MailboxAddress.Parse(c));
-            foreach (var b in bccList) msg.Bcc.Add(MailboxAddress.Parse(b));
-        }
-        catch (Exception ex) { Console.Error.WriteLine($"bad address: {ex.Message}"); return 1; }
-        msg.Subject = subject;
         string domain = fromEmail.Contains('@') ? fromEmail.Substring(fromEmail.IndexOf('@') + 1) : "mailbird.local";
-        msg.MessageId = $"Mailbird-{Guid.NewGuid()}@{domain}";
-        if (parent != null && !string.IsNullOrEmpty(parent.MailMessageId))
-        {
-            string pid = parent.MailMessageId.Trim('<', '>', ' ');
-            msg.InReplyTo = pid;
-            foreach (var r in parent.References) { var rr = r.Trim('<', '>', ' '); if (rr.Length > 0) msg.References.Add(rr); }
-            if (!msg.References.Contains(pid)) msg.References.Add(pid);
-        }
-        var bb = new BodyBuilder();
-        if (html)
-        {
-            // Body is already HTML — append the signature as its own block, keep it HTML-only.
-            bb.HtmlBody = AppendSignatureHtml(body, signature);
-        }
-        else
-        {
-            // Plain-text input: send multipart/alternative so the draft renders with real paragraph
-            // spacing (HTML) while staying readable in text-only clients. Fixes run-on, one-line bodies.
-            var (textBody, htmlBody) = BuildFormattedBody(body, signature);
-            bb.TextBody = textBody;
-            bb.HtmlBody = htmlBody;
-        }
-        msg.Body = bb.ToMessageBody();
+        string mailMessageId = $"Mailbird-{Guid.NewGuid()}@{domain}";
+        string inReplyTo = parent != null && !string.IsNullOrEmpty(parent.MailMessageId) ? parent.MailMessageId : null;
+        var msg = BuildMime(fromName, fromEmail, toList, ccList, bccList, subject, mailMessageId,
+                            inReplyTo, parent?.References, body, html, signature, out var buildErr);
+        if (msg == null) { Console.Error.WriteLine(buildErr); return 1; }
 
         string provider = google ? "google" : "microsoft";
         Console.WriteLine($"Account : {accountId} <{fromEmail}>  [{provider}]");
@@ -510,18 +490,26 @@ internal static class Program
         return s.TrimStart().StartsWith("re:", StringComparison.OrdinalIgnoreCase) ? s : "Re: " + s;
     }
 
-    // Mailbird stores Gmail's threadId as a decimal Int64; the Gmail REST API expects it in hex.
-    static string ToGmailThreadId(string stored)
+    // Mailbird stores Gmail's threadId/messageId as a decimal Int64; the Gmail REST API expects hex.
+    static string ToGmailHex(string stored)
         => string.IsNullOrEmpty(stored) ? stored
            : (ulong.TryParse(stored, out var v) ? v.ToString("x") : stored);
 
-    static int GmailCreate(string token, MimeMessage msg, string threadId)
+    static string ToGmailThreadId(string stored) => ToGmailHex(stored);
+
+    // Serialize a MimeMessage to Gmail's base64url "raw" form (CRLF line endings, RFC-compliant).
+    static string GmailRaw(MimeMessage msg)
     {
         var fo = FormatOptions.Default.Clone();
         fo.NewLineFormat = NewLineFormat.Dos;   // RFC-compliant CRLF
-        byte[] mime;
-        using (var ms = new MemoryStream()) { msg.WriteTo(fo, ms); mime = ms.ToArray(); }
-        string raw = Convert.ToBase64String(mime).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+        using var ms = new MemoryStream();
+        msg.WriteTo(fo, ms);
+        return Convert.ToBase64String(ms.ToArray()).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+    }
+
+    static int GmailCreate(string token, MimeMessage msg, string threadId)
+    {
+        string raw = GmailRaw(msg);
 
         (System.Net.HttpStatusCode status, string body) Post(string thread)
         {
@@ -564,19 +552,23 @@ internal static class Program
         return 0;
     }
 
+    // Locate the Drafts folder over IMAP. Outlook IMAP lacks SPECIAL-USE/XLIST, so GetFolder(Drafts)
+    // throws — fall back to finding a subfolder literally named "Drafts" in the personal namespace.
+    static IMailFolder FindDraftsFolder(ImapClient client)
+    {
+        try { var d = client.GetFolder(SpecialFolder.Drafts); if (d != null) return d; } catch { }
+        var personal = client.GetFolder(client.PersonalNamespaces[0]);
+        foreach (var f in personal.GetSubfolders(false))
+            if (string.Equals(f.Name, "Drafts", StringComparison.OrdinalIgnoreCase)) return f;
+        return null;
+    }
+
     static int ImapAppend(string token, string host, string user, MimeMessage msg)
     {
         using var client = new ImapClient();
         client.Connect(host, 993, SecureSocketOptions.SslOnConnect);
         client.Authenticate(new SaslMechanismOAuth2(user, token));
-        IMailFolder drafts = null;
-        try { drafts = client.GetFolder(SpecialFolder.Drafts); } catch { /* Outlook IMAP lacks SPECIAL-USE/XLIST */ }
-        if (drafts == null)
-        {
-            var personal = client.GetFolder(client.PersonalNamespaces[0]);
-            foreach (var f in personal.GetSubfolders(false))
-                if (string.Equals(f.Name, "Drafts", StringComparison.OrdinalIgnoreCase)) { drafts = f; break; }
-        }
+        var drafts = FindDraftsFolder(client);
         if (drafts == null) { client.Disconnect(true); Console.Error.WriteLine("could not locate the Drafts folder over IMAP"); return 5; }
         drafts.Open(FolderAccess.ReadWrite);
         var uid = drafts.Append(msg, MessageFlags.Draft | MessageFlags.Seen);
@@ -588,6 +580,375 @@ internal static class Program
         {
             Console.WriteLine($"Appended draft to {folder} (uid {(uid.HasValue ? uid.Value.ToString() : "n/a")}).");
             Console.WriteLine("It will sync into Mailbird's Drafts folder on the next poll.");
+        }
+        return 0;
+    }
+
+    // ---- draft list / edit / delete: track and revise drafts that synced into Mailbird ----
+    // The local Messages.Id shown by `draft list` is the handle for `edit`/`delete`. We resolve it to
+    // the provider's draft (Gmail: GmailMessageId_Int64 -> hex -> match in drafts.list -> draftId;
+    // Outlook: Folders_Messages.Uid is the IMAP UID in the Drafts folder).
+
+    sealed class DraftRow
+    {
+        public long Id; public int AccountId; public string GmailMessageId; public string ThreadId;
+        public string MailMessageId; public string InReplyTo; public string Subject; public bool IsDraft;
+        public List<string> References = new(); public List<string> To = new(); public List<string> Cc = new();
+        public string Uid; public string Body;
+    }
+
+    // Build the MimeMessage shared by create + edit. Returns null and sets err on a bad address.
+    static MimeMessage BuildMime(
+        string fromName, string fromEmail,
+        List<string> toList, List<string> ccList, List<string> bccList,
+        string subject, string messageId, string inReplyTo, IEnumerable<string> references,
+        string body, bool html, string signature, out string err)
+    {
+        err = null;
+        var msg = new MimeMessage();
+        msg.From.Add(new MailboxAddress(fromName ?? "", fromEmail));
+        try
+        {
+            foreach (var t in toList) msg.To.Add(MailboxAddress.Parse(t));
+            foreach (var c in ccList) msg.Cc.Add(MailboxAddress.Parse(c));
+            foreach (var b in bccList) msg.Bcc.Add(MailboxAddress.Parse(b));
+        }
+        catch (Exception ex) { err = $"bad address: {ex.Message}"; return null; }
+        msg.Subject = subject ?? "";
+        if (!string.IsNullOrEmpty(messageId)) msg.MessageId = messageId;
+        if (references != null)
+            foreach (var r in references) { var rr = (r ?? "").Trim('<', '>', ' '); if (rr.Length > 0 && !msg.References.Contains(rr)) msg.References.Add(rr); }
+        if (!string.IsNullOrEmpty(inReplyTo))
+        {
+            string pid = inReplyTo.Trim('<', '>', ' ');
+            msg.InReplyTo = pid;
+            if (!msg.References.Contains(pid)) msg.References.Add(pid);
+        }
+        var bb = new BodyBuilder();
+        if (html)
+        {
+            // Body is already HTML — append the signature as its own block, keep it HTML-only.
+            bb.HtmlBody = AppendSignatureHtml(body, signature);
+        }
+        else
+        {
+            // Plain-text input: multipart/alternative so the draft renders with real paragraph spacing.
+            var (textBody, htmlBody) = BuildFormattedBody(body, signature);
+            bb.TextBody = textBody;
+            bb.HtmlBody = htmlBody;
+        }
+        msg.Body = bb.ToMessageBody();
+        return msg;
+    }
+
+    static int DraftList(SqliteConnection con, Dictionary<string, string> opt, List<string> pos)
+    {
+        var p = new Dictionary<string, object>();
+        string acct = "";
+        if (opt.TryGetValue("account", out var ac)) { acct = "AND m.AccountId=$acct"; p["$acct"] = int.Parse(ac); }
+        else if (pos.Count > 0 && int.TryParse(pos[0], out var pa)) { acct = "AND m.AccountId=$acct"; p["$acct"] = pa; }
+        p["$lim"] = OptInt(opt, "limit", 50);
+        // Drafts that synced into Mailbird live in a Drafts folder and carry a DraftChecksum.
+        Query(con, $@"SELECT m.Id, m.AccountId, m.ReceivedAt_UTC AS date,
+                             trim(ff.Subject) AS subject, trim(ff.To_) AS recipient
+                      FROM Messages m
+                      JOIN Folders_Messages fm ON fm.MessageId=m.Id
+                      JOIN Folders fo ON fo.Id=fm.FolderId
+                      JOIN FTS_Messages ff ON ff.rowid=m.Id
+                      WHERE fo.Name LIKE '%Draft%' AND m.DraftChecksum IS NOT NULL {acct}
+                      ORDER BY m.ReceivedAt_UTC DESC LIMIT $lim", p);
+        return 0;
+    }
+
+    static DraftRow LoadDraft(SqliteConnection con, long id)
+    {
+        var d = new DraftRow { Id = id };
+        using (var c = con.CreateCommand())
+        {
+            c.CommandText = @"SELECT AccountId, GmailMessageId_Int64, ThreadId, MailMessageId,
+                                     InReplyTo_MailMessageId, Subject, DraftChecksum
+                              FROM Messages WHERE Id=$id";
+            c.Parameters.AddWithValue("$id", id);
+            using var r = c.ExecuteReader();
+            if (!r.Read()) return null;
+            d.AccountId = Convert.ToInt32(r["AccountId"]);
+            d.GmailMessageId = r["GmailMessageId_Int64"] == DBNull.Value ? null : Convert.ToString(r["GmailMessageId_Int64"], CultureInfo.InvariantCulture);
+            d.ThreadId = r["ThreadId"] as string;
+            d.MailMessageId = r["MailMessageId"] as string;
+            d.InReplyTo = r["InReplyTo_MailMessageId"] as string;
+            d.Subject = r["Subject"] as string ?? "";
+            d.IsDraft = r["DraftChecksum"] != DBNull.Value;
+        }
+        using (var c = con.CreateCommand())
+        {
+            c.CommandText = "SELECT MailMessageId FROM MessageReferences WHERE MessageId=$id ORDER BY Id";
+            c.Parameters.AddWithValue("$id", id);
+            using var r = c.ExecuteReader();
+            while (r.Read()) { var s = r.GetValue(0) as string; if (!string.IsNullOrEmpty(s)) d.References.Add(s); }
+        }
+        using (var c = con.CreateCommand())
+        {
+            // Type 2 = To, 4 = Cc (0 = From, 1 = ReplyTo, 3 = Sender).
+            c.CommandText = "SELECT Type, Email FROM Messages_Contacts WHERE MessageId=$id AND Email IS NOT NULL";
+            c.Parameters.AddWithValue("$id", id);
+            using var r = c.ExecuteReader();
+            while (r.Read())
+            {
+                string e = r["Email"] as string;
+                if (string.IsNullOrWhiteSpace(e)) continue;
+                int t = Convert.ToInt32(r["Type"]);
+                if (t == 2) d.To.Add(e); else if (t == 4) d.Cc.Add(e);
+            }
+        }
+        using (var c = con.CreateCommand())
+        {
+            c.CommandText = @"SELECT fm.Uid FROM Folders_Messages fm JOIN Folders fo ON fo.Id=fm.FolderId
+                              WHERE fm.MessageId=$id AND fo.Name LIKE '%Draft%' LIMIT 1";
+            c.Parameters.AddWithValue("$id", id);
+            d.Uid = c.ExecuteScalar() as string;
+        }
+        using (var c = con.CreateCommand())
+        {
+            c.CommandText = "SELECT Body FROM FTS_Messages WHERE rowid=$id";
+            c.Parameters.AddWithValue("$id", id);
+            d.Body = c.ExecuteScalar() as string ?? "";
+        }
+        return d;
+    }
+
+    // Resolve the provider (google/microsoft) + credential for a draft's account; prints an error and
+    // returns false (with code) on any problem. Shared by edit and delete.
+    static bool ResolveDraftProvider(SqliteConnection con, DraftRow d, out Cred cred, out bool google,
+        out string fromEmail, out string fromName, out int code)
+    {
+        cred = null; google = false; code = 0;
+        (fromEmail, fromName) = ResolveSender(con, d.AccountId);
+        if (fromEmail == null) { Console.Error.WriteLine($"account {d.AccountId} not found"); code = 2; return false; }
+        cred = ResolveCred(con, d.AccountId);
+        if (cred == null || string.IsNullOrEmpty(cred.Token))
+        { Console.Error.WriteLine($"account {d.AccountId}: no usable OAuth token — keep Mailbird running so it refreshes the token."); code = 2; return false; }
+        google = (cred.Scope ?? "").Contains("mail.google.com") || (cred.Host ?? "").Contains("gmail");
+        bool microsoft = (cred.Scope ?? "").Contains("outlook.office.com") || (cred.Host ?? "").Contains("office365") || (cred.Host ?? "").Contains("outlook");
+        if (!google && !microsoft) { Console.Error.WriteLine($"account {d.AccountId}: unrecognized provider (host {cred.Host})"); code = 4; return false; }
+        return true;
+    }
+
+    static int DraftEdit(SqliteConnection con, Dictionary<string, string> opt, List<string> pos)
+    {
+        if (pos.Count == 0 || !long.TryParse(pos[0], out var id))
+        { Console.Error.WriteLine("draft edit needs a numeric messageId (from `draft list`)"); return 1; }
+        var d = LoadDraft(con, id);
+        if (d == null) { Console.Error.WriteLine($"message {id} not found"); return 1; }
+        if (!d.IsDraft) { Console.Error.WriteLine($"message {id} is not a draft (only drafts can be edited)"); return 1; }
+        if (!ResolveDraftProvider(con, d, out var cred, out bool google, out var fromEmail, out var fromName, out var code)) return code;
+
+        // Fields default to the existing draft; any option overrides.
+        var toList = opt.ContainsKey("to") ? SplitAddrs(opt["to"]) : d.To;
+        var ccList = opt.ContainsKey("cc") ? SplitAddrs(opt["cc"]) : d.Cc;
+        var bccList = SplitAddrs(opt.GetValueOrDefault("bcc"));
+        string subject = opt.GetValueOrDefault("subject") ?? d.Subject;
+        bool html = opt.ContainsKey("html");
+        string signature = ResolveSignature(opt);
+
+        string body = opt.GetValueOrDefault("body");
+        if (opt.TryGetValue("body-file", out var bf))
+        {
+            if (!File.Exists(bf)) { Console.Error.WriteLine($"body-file not found: {bf}"); return 1; }
+            body = File.ReadAllText(bf);
+        }
+        bool bodyGiven = body != null;
+        if (!bodyGiven) { body = d.Body; html = false; }   // reuse the draft's existing text if none supplied
+        if (toList.Count == 0) { Console.Error.WriteLine("draft edit: the draft has no recipients — pass --to <addr[,addr]>"); return 1; }
+
+        // Preserve the draft's own Message-ID so its identity/threading carries across the edit.
+        var msg = BuildMime(fromName, fromEmail, toList, ccList, bccList, subject, d.MailMessageId,
+                            d.InReplyTo, d.References, body, html, signature, out var berr);
+        if (msg == null) { Console.Error.WriteLine(berr); return 1; }
+
+        Console.WriteLine($"Edit    : draft msg {id}  account {d.AccountId} <{fromEmail}>  [{(google ? "google" : "microsoft")}]");
+        Console.WriteLine($"To      : {string.Join(", ", toList)}");
+        Console.WriteLine($"Subject : {subject}");
+        if (!bodyGiven) Console.Error.WriteLine("note: no --body given; reusing the draft's existing text (HTML formatting may simplify).");
+        if (opt.ContainsKey("dry-run")) { Console.WriteLine("[dry-run] nothing changed."); return 0; }
+        if (cred.Expires != default && cred.Expires < DateTime.UtcNow)
+            Console.Error.WriteLine("warning: the stored access token looks expired; keep Mailbird running so it refreshes the token.");
+
+        try
+        {
+            if (google)
+            {
+                string draftId = GmailFindDraftId(cred.Token, ToGmailHex(d.GmailMessageId), ToGmailHex(d.ThreadId));
+                if (draftId == null) { Console.Error.WriteLine("could not find this draft on Gmail (it may not have synced yet, or was already sent/deleted)."); return 5; }
+                return GmailUpdate(cred.Token, draftId, msg, ToGmailThreadId(d.ThreadId));
+            }
+            if (string.IsNullOrEmpty(d.Uid)) { Console.Error.WriteLine("draft has no server UID yet (not synced) — try again once it appears in Mailbird."); return 5; }
+            return ImapReplace(cred.Token, cred.Host, cred.Username ?? fromEmail, d.Uid, msg);
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"draft edit failed: {ex.Message}"); return 5; }
+    }
+
+    static int DraftDelete(SqliteConnection con, Dictionary<string, string> opt, List<string> pos)
+    {
+        if (pos.Count == 0 || !long.TryParse(pos[0], out var id))
+        { Console.Error.WriteLine("draft delete needs a numeric messageId (from `draft list`)"); return 1; }
+        var d = LoadDraft(con, id);
+        if (d == null) { Console.Error.WriteLine($"message {id} not found"); return 1; }
+        if (!d.IsDraft) { Console.Error.WriteLine($"message {id} is not a draft (refusing to delete a non-draft message)"); return 1; }
+        if (!ResolveDraftProvider(con, d, out var cred, out bool google, out var fromEmail, out _, out var code)) return code;
+
+        Console.WriteLine($"Delete  : draft msg {id}  account {d.AccountId} <{fromEmail}>  [{(google ? "google" : "microsoft")}]  subject \"{d.Subject}\"");
+        if (opt.ContainsKey("dry-run")) { Console.WriteLine("[dry-run] nothing deleted."); return 0; }
+
+        try
+        {
+            if (google)
+            {
+                string draftId = GmailFindDraftId(cred.Token, ToGmailHex(d.GmailMessageId), ToGmailHex(d.ThreadId));
+                if (draftId == null) { Console.Error.WriteLine("could not find this draft on Gmail (already gone?)."); return 5; }
+                return GmailDelete(cred.Token, draftId);
+            }
+            if (string.IsNullOrEmpty(d.Uid)) { Console.Error.WriteLine("draft has no server UID yet (not synced)."); return 5; }
+            return ImapDelete(cred.Token, cred.Host, cred.Username ?? fromEmail, d.Uid);
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"draft delete failed: {ex.Message}"); return 5; }
+    }
+
+    // Find a Gmail draftId for a draft Mailbird synced. Primary key: the message id (hex) Mailbird stored.
+    // After an in-place edit the underlying message id changes but Mailbird's local row can lag (it still
+    // points at the old, now-deleted message), so fall back to the threadId — which is stable across edits
+    // — when the message-id lookup misses. Gmail has no "get draft by message/thread id", so page through
+    // drafts.list and match.
+    static string GmailFindDraftId(string token, string messageIdHex, string threadIdHex)
+    {
+        if (string.IsNullOrEmpty(messageIdHex) && string.IsNullOrEmpty(threadIdHex)) return null;
+        using var http = new HttpClient();
+        string pageToken = null;
+        var threadMatches = new List<string>();
+        do
+        {
+            string url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts?maxResults=100&fields=drafts(id,message/id,message/threadId),nextPageToken";
+            if (!string.IsNullOrEmpty(pageToken)) url += "&pageToken=" + Uri.EscapeDataString(pageToken);
+            var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            using var resp = http.Send(req);
+            using var sr = new StreamReader(resp.Content.ReadAsStream());
+            string respBody = sr.ReadToEnd();
+            if ((int)resp.StatusCode < 200 || (int)resp.StatusCode >= 300)
+                throw new InvalidOperationException($"Gmail drafts.list HTTP {(int)resp.StatusCode}: {respBody}");
+            using var doc = JsonDocument.Parse(respBody);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("drafts", out var arr) && arr.ValueKind == JsonValueKind.Array)
+                foreach (var dft in arr.EnumerateArray())
+                {
+                    if (!dft.TryGetProperty("message", out var m)) continue;
+                    string did = dft.GetProperty("id").GetString();
+                    if (!string.IsNullOrEmpty(messageIdHex) && m.TryGetProperty("id", out var mid)
+                        && string.Equals(mid.GetString(), messageIdHex, StringComparison.OrdinalIgnoreCase))
+                        return did;   // exact message-id match wins
+                    if (!string.IsNullOrEmpty(threadIdHex) && m.TryGetProperty("threadId", out var tid)
+                        && string.Equals(tid.GetString(), threadIdHex, StringComparison.OrdinalIgnoreCase))
+                        threadMatches.Add(did);
+                }
+            pageToken = root.TryGetProperty("nextPageToken", out var nt) ? nt.GetString() : null;
+        } while (!string.IsNullOrEmpty(pageToken));
+        // No exact message-id match — accept a UNIQUE thread match (don't guess if a thread has several drafts).
+        return threadMatches.Count == 1 ? threadMatches[0] : null;
+    }
+
+    static int GmailUpdate(string token, string draftId, MimeMessage msg, string threadId)
+    {
+        string raw = GmailRaw(msg);
+        object payload = string.IsNullOrEmpty(threadId)
+            ? new { message = new { raw } }
+            : new { message = new { raw, threadId } };
+        using var http = new HttpClient();
+        var req = new HttpRequestMessage(HttpMethod.Put, $"https://gmail.googleapis.com/gmail/v1/users/me/drafts/{draftId}")
+        { Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json") };
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        using var resp = http.Send(req);
+        using var sr = new StreamReader(resp.Content.ReadAsStream());
+        string body = sr.ReadToEnd();
+        if ((int)resp.StatusCode < 200 || (int)resp.StatusCode >= 300)
+            throw new InvalidOperationException($"Gmail drafts.update HTTP {(int)resp.StatusCode}: {body}");
+        using var doc = JsonDocument.Parse(body);
+        string newMsgId = doc.RootElement.TryGetProperty("message", out var mm) && mm.TryGetProperty("id", out var mi) ? mi.GetString() : null;
+        if (Json)
+            Console.WriteLine(JsonSerializer.Serialize(new { ok = true, provider = "google", action = "update", draftId, messageId = newMsgId }));
+        else
+        {
+            Console.WriteLine($"Updated Gmail draft {draftId}.");
+            Console.WriteLine("Mailbird will reflect the change on its next poll.");
+        }
+        return 0;
+    }
+
+    static int GmailDelete(string token, string draftId)
+    {
+        using var http = new HttpClient();
+        var req = new HttpRequestMessage(HttpMethod.Delete, $"https://gmail.googleapis.com/gmail/v1/users/me/drafts/{draftId}");
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        using var resp = http.Send(req);
+        if ((int)resp.StatusCode < 200 || (int)resp.StatusCode >= 300)
+        {
+            using var sr = new StreamReader(resp.Content.ReadAsStream());
+            throw new InvalidOperationException($"Gmail drafts.delete HTTP {(int)resp.StatusCode}: {sr.ReadToEnd()}");
+        }
+        if (Json) Console.WriteLine(JsonSerializer.Serialize(new { ok = true, provider = "google", action = "delete", draftId }));
+        else
+        {
+            Console.WriteLine($"Deleted Gmail draft {draftId}.");
+            Console.WriteLine("Mailbird will remove it from Drafts on its next poll.");
+        }
+        return 0;
+    }
+
+    // IMAP has no in-place update: append the revised draft, then flag the old UID \Deleted and expunge.
+    static int ImapReplace(string token, string host, string user, string oldUid, MimeMessage msg)
+    {
+        using var client = new ImapClient();
+        client.Connect(host, 993, SecureSocketOptions.SslOnConnect);
+        client.Authenticate(new SaslMechanismOAuth2(user, token));
+        var drafts = FindDraftsFolder(client);
+        if (drafts == null) { client.Disconnect(true); Console.Error.WriteLine("could not locate the Drafts folder over IMAP"); return 5; }
+        drafts.Open(FolderAccess.ReadWrite);
+        var newUid = drafts.Append(msg, MessageFlags.Draft | MessageFlags.Seen);
+        if (uint.TryParse(oldUid, out var ou))
+        {
+            drafts.AddFlags(new UniqueId(ou), MessageFlags.Deleted, true);
+            drafts.Expunge();
+        }
+        string folder = drafts.FullName;
+        client.Disconnect(true);
+        if (Json)
+            Console.WriteLine(JsonSerializer.Serialize(new { ok = true, provider = "microsoft", action = "update", folder, appendUid = newUid.HasValue ? (object)newUid.Value.Id : null, deletedUid = oldUid }));
+        else
+        {
+            Console.WriteLine($"Replaced draft in {folder} (new uid {(newUid.HasValue ? newUid.Value.ToString() : "n/a")}, removed {oldUid}).");
+            Console.WriteLine("Mailbird will reflect the change on its next poll.");
+        }
+        return 0;
+    }
+
+    static int ImapDelete(string token, string host, string user, string uid)
+    {
+        using var client = new ImapClient();
+        client.Connect(host, 993, SecureSocketOptions.SslOnConnect);
+        client.Authenticate(new SaslMechanismOAuth2(user, token));
+        var drafts = FindDraftsFolder(client);
+        if (drafts == null) { client.Disconnect(true); Console.Error.WriteLine("could not locate the Drafts folder over IMAP"); return 5; }
+        drafts.Open(FolderAccess.ReadWrite);
+        if (uint.TryParse(uid, out var u))
+        {
+            drafts.AddFlags(new UniqueId(u), MessageFlags.Deleted, true);
+            drafts.Expunge();
+        }
+        string folder = drafts.FullName;
+        client.Disconnect(true);
+        if (Json) Console.WriteLine(JsonSerializer.Serialize(new { ok = true, provider = "microsoft", action = "delete", folder, deletedUid = uid }));
+        else
+        {
+            Console.WriteLine($"Deleted draft uid {uid} from {folder}.");
+            Console.WriteLine("Mailbird will remove it from Drafts on its next poll.");
         }
         return 0;
     }
@@ -672,6 +1033,11 @@ USAGE
   mailbird-cli [<db>] draft [--account ID] --to <addr[,addr]> [--subject S] [--body B | --body-file F]
                        [--reply-to <messageId>] [--cc ..] [--bcc ..] [--html]
                        [--signature S | --no-signature] [--dry-run] [--json]
+  mailbird-cli [<db>] draft list [accountId] [--account ID] [--limit N] [--json]
+  mailbird-cli [<db>] draft edit <messageId> [--subject S] [--body B | --body-file F]
+                       [--to ..] [--cc ..] [--bcc ..] [--html] [--signature S | --no-signature]
+                       [--dry-run] [--json]
+  mailbird-cli [<db>] draft delete <messageId> [--dry-run] [--json]
   mailbird-cli [<db>] accounts
   mailbird-cli [<db>] folders [accountId]
   mailbird-cli [<db>] search <query...> [--account ID] [--limit N] [--raw]
@@ -686,6 +1052,10 @@ USAGE
        with --reply-to, attaches to that message's thread. Never sends. (Reads the DB read-only.)
        A plain-text body is sent as multipart/alternative with proper paragraph spacing (blank lines =
        paragraphs, single newlines = line breaks); pass --html if the body is already HTML.
+  draft list  shows drafts that have synced into Mailbird (local Id + account + subject + recipient).
+  draft edit  revises a synced draft IN PLACE by its local Id (Gmail drafts.update / Outlook IMAP
+       replace). Unspecified fields (to/cc/subject/body) keep their current values. Never sends.
+  draft delete removes a synced draft by its local Id (server-side; Mailbird drops it on next poll).
   signature: optional, off by default. When set via --signature ""..."" (use \n for line breaks) or the
        MAILBIRD_SIGNATURE env var, it is appended after a blank line at the end of the body.
   <db> is optional; defaults to %LOCALAPPDATA%\Mailbird\Store\Store.db (override with MAILBIRD_STORE_DB).
