@@ -7,9 +7,12 @@ description: >-
   Drafts with the chosen From account and, for replies, attached to the correct thread (never sends);
   (2) COMPOSE — open a pre-filled compose window for human review (mailto: handoff; cannot set
   From/attachments/HTML); (3) READ and SEARCH — query Mailbird's local Store.db read-only to
-  full-text search mail, list folders and recent messages, and read a message's headers plus body.
+  full-text search mail, list folders and recent messages, and read a message's headers, body, and
+  ATTACHMENTS — every read returns the full local file path of each downloaded attachment, so you can
+  open, parse, or analyze the actual PDF/image/document directly.
   Use whenever the user wants to draft, compose, write, or reply to an email via Mailbird, OR to
-  find, search, look up, read, or summarize existing emails in their Mailbird mailboxes.
+  find, search, look up, read, or summarize existing emails in their Mailbird mailboxes, OR to open,
+  read, extract, or analyze an email attachment.
 ---
 
 # Mailbird (compose + read/search)
@@ -142,7 +145,7 @@ The CLI opens `Store.db` with `Mode=ReadOnly` and never writes.
 & $cli folders 4                                 # folders (+ counts) for an account
 & $cli search "invoice overdue" --limit 10       # full-text search (subject/body/from/to)
 & $cli list --folder Inbox --account 4 --unread  # recent messages, filtered
-& $cli read 112097                               # one message: headers + body text
+& $cli read 112097                               # one message: headers + ATTACHMENT PATHS + body text
 ```
 
 Append `--json` to any read/search command for machine-readable output (an array of row objects),
@@ -150,8 +153,46 @@ e.g. `& $cli search "receipt" --limit 5 --json | ConvertFrom-Json`.
 
 ### Workflow
 1. `accounts` / `folders` first if you need an AccountId or folder name to scope a query.
-2. `search` (or `list`) to find messages — note the `Id` column.
-3. `read <Id>` to get the body, then answer/summarize for the user.
+2. `search` (or `list`) to find messages — note the `Id` column, and the `att` column (count of real
+   attachments on that message).
+3. `read <Id>` to get the body **and the full path of every attachment**, then answer/summarize.
+4. If the answer depends on an attachment, open the printed path directly (see below).
+
+### Attachments — you get the real file path, by default
+
+Mailbird auto-downloads attachments to disk. **`read` always lists them with the full local path**, so
+you never need an export step — just open the path with your normal file tools (read the PDF, view the
+image, parse the spreadsheet).
+
+```
+Attach  : 2 (+1 inline hidden — --all to show)
+  [40359] Report.pdf (52.7 KB, APPLICATION/PDF)
+        C:\Users\Keith\AppData\Local\Mailbird\Store\A\40359\Report.pdf
+  [40361] Screenshot.png (317.6 KB, IMAGE/PNG)
+        C:\Users\Keith\AppData\Local\Mailbird\Store\A\40361\Screenshot.png
+```
+
+```powershell
+& $cli read 113846                        # headers + attachment paths + body (paths come free)
+& $cli attachments 113846                 # just the attachments for one message
+& $cli attachments 113846 --json          # id, fileName, size, contentType, inline, downloaded, path
+& $cli attachments 113846 --all           # include inline cid: images too
+& $cli list --has-attachments --days 30   # only messages that actually have attachments
+& $cli attachment save 40359 40361 --out C:\temp\out    # copy blobs to a writable folder
+```
+
+**How to use them:**
+- Take the `path` from `read`/`attachments` and open it directly — it's a normal file on disk. To read a
+  PDF, pass that path to your file-reading tool; same for images and documents.
+- The store files are **read-only**; never write to or delete anything under `…\Mailbird\Store\A\`. If a
+  tool needs a writable copy (or the user wants the file somewhere convenient), use `attachment save`.
+- **`downloaded: false` / `(not downloaded)`** means the row exists but Mailbird never fetched the blob —
+  there is no local file and `path` is null. Common for older archived mail. Tell the user to open that
+  message in Mailbird to pull it down; don't claim you read a file that isn't there.
+- **Inline images are hidden by default.** Most attachment rows are `cid:` images embedded in HTML bodies
+  (signature logos, tracking pixels) — noise. `read`/`attachments` show only real attachments unless you
+  pass `--all`. The `att` column in `list`/`search` counts real attachments only.
+- The `[40359]` number is the **attachment id** (what `attachment save` takes) — not the message id.
 
 ### Search syntax
 - Default: plain words are AND, punctuation-safe (e.g. `search "self-test report"`).
@@ -161,8 +202,10 @@ e.g. `& $cli search "receipt" --limit 5 --json | ConvertFrom-Json`.
 - Read-only; never modifies the DB; safe while Mailbird runs.
 - The body shown is Mailbird's indexed text (HTML rendered to text) — ideal for reading/summarizing;
   it is not the raw MIME source.
-- Dates are UTC. `rd` (IsRead): 1 = read, 0 = unread.
+- Dates are UTC. `rd` (IsRead): 1 = read, 0 = unread. `att` = count of real (non-inline) attachments.
 - Don't dump large raw rows back to the user — summarize and cite message `Id`s.
+- Attachment blobs live in the `A` folder next to `Store.db` (`A\<attachmentId>\<filename>`); the CLI
+  resolves that for you. `MAILBIRD_STORE_DB` moves both the DB and the attachment root together.
 - Override the database location with the `MAILBIRD_STORE_DB` environment variable if needed.
 
 See `references/store-db-schema.md` for the relevant Store.db tables/columns.
