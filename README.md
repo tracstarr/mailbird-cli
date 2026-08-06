@@ -7,6 +7,8 @@ Compose drafts and search your local **Mailbird** mail from the command line —
   (`mailto:` handoff; **never auto-sends**)
 - **search / list / read** — full-text search and read your mail straight from Mailbird's local
   database (**read-only**)
+- **attachments** — every `read` returns the full local path of each downloaded attachment, so tools
+  and agents can open the actual PDF/image/document without an export step
 
 Everything stays on your machine. The database is opened read-only, and nothing is sent without you
 clicking Send in Mailbird.
@@ -40,13 +42,31 @@ Or install it as a Claude Code skill (available in any session):
 |---|---|
 | `compose --to A --subject S --body B` | Open a pre-filled draft for review (`--cc` `--bcc` `--body-file` `--signature` `--dry-run`). |
 | `search <query> [--account ID] [--limit N] [--raw]` | Full-text search (subject/body/from/to). |
-| `list [--folder NAME] [--account ID] [--from SUBSTR] [--unread] [--days N] [--limit N]` | Recent messages. |
-| `read <messageId> [--max CHARS]` | One message: headers + body text. |
+| `list [--folder NAME] [--account ID] [--from SUBSTR] [--unread] [--days N] [--has-attachments] [--limit N]` | Recent messages. |
+| `read <messageId> [--max CHARS] [--all]` | One message: headers + attachment paths + body text. |
+| `attachments <messageId> [--all]` | Attachments for one message, with full on-disk paths. |
+| `attachment save <attachmentId...> [--out DIR]` | Copy attachment blobs out of the read-only store. |
 | `accounts` / `folders [accountId]` | Discover mailboxes / folders. |
 | `tables` / `schema <like>` / `sql <query>` | Raw read-only access to the database. |
 
 Append `--json` to any read/search command for machine-readable output. Run the CLI with no
 arguments for full usage.
+
+### Attachments
+
+Mailbird downloads attachments to an `A` folder beside `Store.db` (`A\<attachmentId>\<filename>`).
+The CLI resolves that convention for you, so `read` prints a ready-to-open path:
+
+```
+Attach  : 1 (+1 inline hidden — --all to show)
+  [40359] Report.pdf (52.7 KB, APPLICATION/PDF)
+        C:\Users\you\AppData\Local\Mailbird\Store\A\40359\Report.pdf
+```
+
+Inline `cid:` images (signature logos and the like) are hidden by default — pass `--all` to include
+them. `downloaded: false` means the row exists but Mailbird never fetched the blob, so there is no
+local file; open the message in Mailbird to pull it down. Store files are read-only — use
+`attachment save` when you need a writable copy.
 
 ## Releases
 

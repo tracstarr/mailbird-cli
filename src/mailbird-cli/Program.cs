@@ -36,6 +36,20 @@ internal static class Program
 
     static bool Json;   // when set, tabular modes emit a JSON array instead of pipe-delimited text
 
+    // Root of Mailbird's attachment blob store — the "A" folder sitting next to Store.db. Mailbird
+    // saves each downloaded attachment as  A\<Attachments.Id>\<SuggestedFileName>  (one directory per
+    // attachment row, exactly one file inside). There is no path column in the DB; it's this convention.
+    static string AttachRoot;
+
+    static string ResolveAttachRoot(string dbPath)
+        => Path.Combine(Path.GetDirectoryName(Path.GetFullPath(dbPath)) ?? ".", "A");
+
+    // Count of real (non-inline) attachments on a message — the SQL twin of IsInline(), used so
+    // `list` and `search` can flag which hits have files worth pulling. Indexed on MessageId.
+    const string AttCountSql = @"(SELECT COUNT(*) FROM Attachments at WHERE at.MessageId=m.Id
+          AND coalesce(at.IsContentIdInBody,
+                       CASE WHEN at.ContentId IS NULL OR at.ContentId='' THEN 0 ELSE 1 END)=0)";
+
     // Optional signature appended to the end of a draft/compose body (after a blank line) when one is
     // requested via --signature "..." or the MAILBIRD_SIGNATURE env var. Empty = no signature by default
     // (Mailbird applies the account's own signature on send, so adding one here would duplicate it).
@@ -62,6 +76,7 @@ internal static class Program
         if (mode is "-h" or "--help" or "help") { Usage(); return 0; }
 
         if (!File.Exists(db)) { Console.Error.WriteLine($"DB not found: {db}"); return 2; }
+        AttachRoot = ResolveAttachRoot(db);
         string cs = new SqliteConnectionStringBuilder
         { DataSource = db, Mode = SqliteOpenMode.ReadOnly, Cache = SqliteCacheMode.Private }.ToString();
 
@@ -102,6 +117,7 @@ internal static class Program
                 {
                     Query(con, $@"SELECT m.Id, m.ReceivedAt_UTC AS date, m.IsRead AS rd,
                                          trim(ff.From_) AS sender, trim(ff.Subject) AS subject,
+                                         {AttCountSql} AS att,
                                          snippet(FTS_Messages, 1, '«', '»', '…', 6) AS match
                                   FROM FTS_Messages ff JOIN Messages m ON m.Id=ff.rowid
                                   WHERE FTS_Messages MATCH $q {acct}
@@ -129,6 +145,7 @@ internal static class Program
                 }
                 if (opt.TryGetValue("account", out var ac)) { w.Add("m.AccountId=$acct"); p["$acct"] = int.Parse(ac); }
                 if (opt.ContainsKey("unread")) w.Add("m.IsRead=0");
+                if (opt.ContainsKey("has-attachments") || opt.ContainsKey("attachments")) w.Add($"{AttCountSql} > 0");
                 if (opt.TryGetValue("from", out var fr)) { w.Add("ff.From_ LIKE $from"); p["$from"] = "%" + fr + "%"; }
                 if (opt.TryGetValue("days", out var dv))
                 {
@@ -138,7 +155,8 @@ internal static class Program
                 }
                 string where = w.Count > 0 ? "WHERE " + string.Join(" AND ", w) : "";
                 Query(con, $@"SELECT DISTINCT m.Id, m.ReceivedAt_UTC AS date, m.IsRead AS rd,
-                                     trim(ff.From_) AS sender, trim(ff.Subject) AS subject
+                                     trim(ff.From_) AS sender, trim(ff.Subject) AS subject,
+                                     {AttCountSql} AS att
                               FROM Messages m JOIN FTS_Messages ff ON ff.rowid=m.Id {folderJoin}
                               {where}
                               ORDER BY m.ReceivedAt_UTC DESC LIMIT $lim", p);
@@ -149,8 +167,18 @@ internal static class Program
             {
                 if (pos.Count == 0) { Console.Error.WriteLine("read needs a messageId"); return 1; }
                 long id = long.Parse(pos[0]);
-                ReadMessage(con, id, OptInt(opt, "max", 16000));
+                ReadMessage(con, id, OptInt(opt, "max", 16000), opt.ContainsKey("all"));
                 break;
+            }
+
+            case "attachments":
+            case "attachment":
+            case "att":
+            {
+                // `attachment save <id...>` copies blobs out; bare `attachments <messageId>` lists them.
+                string sub = pos.Count > 0 ? pos[0].ToLowerInvariant() : "";
+                if (sub is "save" or "extract" or "copy") return AttachmentSave(con, opt, pos.Skip(1).ToList());
+                return Attachments(con, opt, pos);
             }
 
             case "draft":
@@ -300,7 +328,7 @@ internal static class Program
         return (text, doc);
     }
 
-    static void ReadMessage(SqliteConnection con, long id, int maxBody)
+    static void ReadMessage(SqliteConnection con, long id, int maxBody, bool allAttachments)
     {
         using (var cmd = con.CreateCommand())
         {
@@ -318,6 +346,36 @@ internal static class Program
                 fc.Parameters.AddWithValue("$id", id);
                 folders = fc.ExecuteScalar() as string ?? "";
             }
+            string body = r["Body"] as string ?? "";
+            bool truncated = body.Length > maxBody;
+            string shown = truncated ? body.Substring(0, maxBody) : body;
+
+            // Attachments always come back with the message — agents get the on-disk path for free.
+            var allAtts = LoadAttachments(con, id);
+            var atts = KeepVisible(allAtts, allAttachments);
+            int hiddenInline = allAtts.Count - atts.Count;
+
+            if (Json)
+            {
+                Console.WriteLine(JsonSerializer.Serialize(new Dictionary<string, object>
+                {
+                    ["Id"] = id,
+                    ["date"] = r["ReceivedAt_UTC"]?.ToString(),
+                    ["from"] = (r["From_"] as string)?.Trim(),
+                    ["to"] = (r["To_"] as string)?.Trim(),
+                    ["cc"] = (r["Cc"] as string)?.Trim(),
+                    ["subject"] = (r["Subject"] as string)?.Trim(),
+                    ["folder"] = folders,
+                    ["isRead"] = Convert.ToInt64(r["IsRead"]) != 0,
+                    ["accountId"] = Convert.ToInt64(r["AccountId"]),
+                    ["attachments"] = atts.Select(a => a.ToDict()).ToList(),
+                    ["inlineHidden"] = hiddenInline,
+                    ["bodyTruncated"] = truncated,
+                    ["body"] = shown,
+                }));
+                return;
+            }
+
             Console.WriteLine($"Id      : {id}");
             Console.WriteLine($"Date    : {r["ReceivedAt_UTC"]}");
             Console.WriteLine($"From    : {(r["From_"] as string)?.Trim()}");
@@ -326,10 +384,207 @@ internal static class Program
             if (!string.IsNullOrEmpty(cc)) Console.WriteLine($"Cc      : {cc}");
             Console.WriteLine($"Subject : {(r["Subject"] as string)?.Trim()}");
             Console.WriteLine($"Folder  : {folders}    Read: {(Convert.ToInt64(r["IsRead"]) != 0 ? "yes" : "no")}");
+            PrintAttachmentBlock(atts, hiddenInline);
             Console.WriteLine(new string('-', 72));
-            string body = r["Body"] as string ?? "";
-            Console.WriteLine(body.Length > maxBody ? body.Substring(0, maxBody) + $"\n…[truncated {body.Length - maxBody} more chars]" : body);
+            Console.WriteLine(truncated ? shown + $"\n…[truncated {body.Length - maxBody} more chars]" : shown);
         }
+    }
+
+    // ---- attachments: DB row + the file Mailbird downloaded for it ----
+    sealed class Att
+    {
+        public long Id; public long MessageId; public string FileName; public long Size;
+        public string ContentType; public string ContentId; public bool Inline;
+        public string Path; public bool Downloaded; public long DiskSize;
+
+        public Dictionary<string, object> ToDict() => new Dictionary<string, object>
+        {
+            ["id"] = Id,
+            ["messageId"] = MessageId,
+            ["fileName"] = FileName,
+            ["size"] = Size,
+            ["contentType"] = ContentType,
+            ["inline"] = Inline,
+            ["downloaded"] = Downloaded,
+            ["path"] = Path,          // full path; null when the blob was never downloaded
+        };
+    }
+
+    // An attachment is "inline" when it's a cid:-referenced image embedded in the HTML body (signature
+    // logos and the like) rather than something the sender actually attached. IsContentIdInBody is the
+    // precise flag but is NULL on older rows, so fall back to the presence of a ContentId.
+    static bool IsInline(string contentId, object inBody)
+        => inBody != null && inBody != DBNull.Value
+            ? Convert.ToInt64(inBody) != 0
+            : !string.IsNullOrEmpty(contentId);
+
+    // Loads every attachment row for a message (inline ones included) with its blob resolved; callers
+    // filter with KeepVisible so they can still report how many inline images they hid.
+    static List<Att> LoadAttachments(SqliteConnection con, long messageId)
+    {
+        var list = new List<Att>();
+        using var cmd = con.CreateCommand();
+        cmd.CommandText = @"SELECT Id, MessageId, SuggestedFileName, Size, ContentType, ContentId,
+                                   IsContentIdInBody
+                            FROM Attachments WHERE MessageId=$id ORDER BY Id";
+        cmd.Parameters.AddWithValue("$id", messageId);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            string cid = r.IsDBNull(5) ? null : r.GetString(5);
+            bool inline = IsInline(cid, r.IsDBNull(6) ? null : r.GetValue(6));
+            var a = new Att
+            {
+                Id = r.GetInt64(0),
+                MessageId = r.GetInt64(1),
+                FileName = r.IsDBNull(2) ? "" : r.GetString(2),
+                Size = r.IsDBNull(3) ? 0 : r.GetInt64(3),
+                ContentType = r.IsDBNull(4) ? "" : r.GetString(4),
+                ContentId = cid,
+                Inline = inline,
+            };
+            Resolve(a);
+            list.Add(a);
+        }
+        return list;
+    }
+
+    static List<Att> KeepVisible(List<Att> all, bool includeInline)
+        => includeInline ? all : all.Where(a => !a.Inline).ToList();
+
+    // Locate the downloaded blob. Normally A\<Id>\<SuggestedFileName>; if the stored name and the
+    // on-disk name ever disagree (sanitized characters), fall back to whatever single file is in the
+    // attachment's own directory — it only ever holds one.
+    static void Resolve(Att a)
+    {
+        if (AttachRoot == null) return;
+        string dir = Path.Combine(AttachRoot, a.Id.ToString(CultureInfo.InvariantCulture));
+        string p = Path.Combine(dir, a.FileName ?? "");
+        if (!File.Exists(p))
+        {
+            p = null;
+            if (Directory.Exists(dir))
+            {
+                var files = Directory.GetFiles(dir);
+                if (files.Length > 0) p = files[0];
+            }
+        }
+        if (p == null) return;
+        a.Path = Path.GetFullPath(p);
+        a.Downloaded = true;
+        try { a.DiskSize = new FileInfo(a.Path).Length; } catch { a.DiskSize = -1; }
+    }
+
+    static string HumanSize(long b)
+        => b >= 1048576 ? $"{b / 1048576.0:0.#} MB"
+         : b >= 1024 ? $"{b / 1024.0:0.#} KB"
+         : $"{b} B";
+
+    static void PrintAttachmentBlock(List<Att> atts, int hiddenInline)
+    {
+        if (atts.Count == 0)
+        {
+            if (hiddenInline > 0) Console.WriteLine($"Attach  : none ({hiddenInline} inline image(s) hidden — --all to show)");
+            return;
+        }
+        Console.WriteLine($"Attach  : {atts.Count}" + (hiddenInline > 0 ? $" (+{hiddenInline} inline hidden — --all to show)" : ""));
+        foreach (var a in atts)
+        {
+            string tag = a.Inline ? " [inline]" : "";
+            Console.WriteLine($"  [{a.Id}] {a.FileName} ({HumanSize(a.Size)}, {a.ContentType}){tag}");
+            Console.WriteLine(a.Downloaded
+                ? $"        {a.Path}"
+                : "        (not downloaded — no local file; open the message in Mailbird to fetch it)");
+        }
+    }
+
+    // ---- attachments <messageId> : list one message's attachments with full on-disk paths ----
+    static int Attachments(SqliteConnection con, Dictionary<string, string> opt, List<string> pos)
+    {
+        if (pos.Count == 0) { Console.Error.WriteLine("attachments needs a messageId"); return 1; }
+        if (!long.TryParse(pos[0], out var id)) { Console.Error.WriteLine("attachments needs a numeric messageId"); return 1; }
+        bool all = opt.ContainsKey("all");
+        var allAtts = LoadAttachments(con, id);
+        var atts = KeepVisible(allAtts, all);
+        int hiddenInline = allAtts.Count - atts.Count;
+
+        if (Json) { Console.WriteLine(JsonSerializer.Serialize(atts.Select(a => a.ToDict()).ToList())); return 0; }
+        if (atts.Count == 0)
+        {
+            Console.WriteLine($"[0 attachment(s)] message {id}"
+                + (hiddenInline > 0 ? $"  ({hiddenInline} inline image(s) hidden — use --all)" : ""));
+            return 0;
+        }
+        Console.WriteLine("id | file | size | type | inline | downloaded | path");
+        foreach (var a in atts)
+            Console.WriteLine($"{a.Id} | {a.FileName} | {a.Size} | {a.ContentType} | {(a.Inline ? 1 : 0)} | {(a.Downloaded ? 1 : 0)} | {a.Path}");
+        Console.WriteLine($"[{atts.Count} attachment(s)]"
+            + (hiddenInline > 0 ? $"  (+{hiddenInline} inline hidden — use --all)" : ""));
+        return 0;
+    }
+
+    // ---- attachment save <attachmentId...> [--out DIR] : copy blobs out of the read-only store ----
+    static int AttachmentSave(SqliteConnection con, Dictionary<string, string> opt, List<string> pos)
+    {
+        if (pos.Count == 0) { Console.Error.WriteLine("attachment save needs one or more attachment ids"); return 1; }
+        string outDir = opt.TryGetValue("out", out var o) ? o : Directory.GetCurrentDirectory();
+        var ids = new List<long>();
+        foreach (var s in pos)
+        {
+            if (!long.TryParse(s, out var v)) { Console.Error.WriteLine($"not a numeric attachment id: {s}"); return 1; }
+            ids.Add(v);
+        }
+
+        var saved = new List<Dictionary<string, object>>();
+        int failed = 0;
+        foreach (var id in ids)
+        {
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = @"SELECT Id, MessageId, SuggestedFileName, Size, ContentType, ContentId,
+                                       IsContentIdInBody
+                                FROM Attachments WHERE Id=$id";
+            cmd.Parameters.AddWithValue("$id", id);
+            Att a = null;
+            using (var r = cmd.ExecuteReader())
+            {
+                if (r.Read())
+                {
+                    string cid = r.IsDBNull(5) ? null : r.GetString(5);
+                    a = new Att
+                    {
+                        Id = r.GetInt64(0),
+                        MessageId = r.GetInt64(1),
+                        FileName = r.IsDBNull(2) ? "" : r.GetString(2),
+                        Size = r.IsDBNull(3) ? 0 : r.GetInt64(3),
+                        ContentType = r.IsDBNull(4) ? "" : r.GetString(4),
+                        ContentId = cid,
+                        Inline = IsInline(cid, r.IsDBNull(6) ? null : r.GetValue(6)),
+                    };
+                    Resolve(a);
+                }
+            }
+            if (a == null) { Console.Error.WriteLine($"attachment {id} not found"); failed++; continue; }
+            if (!a.Downloaded) { Console.Error.WriteLine($"attachment {id} ({a.FileName}) has no local file — not downloaded"); failed++; continue; }
+
+            try
+            {
+                Directory.CreateDirectory(outDir);
+                // Never clobber: Name.pdf -> Name (2).pdf -> Name (3).pdf …
+                string baseName = Path.GetFileName(a.Path);
+                string dest = Path.Combine(outDir, baseName);
+                string stem = Path.GetFileNameWithoutExtension(baseName), ext = Path.GetExtension(baseName);
+                for (int n = 2; File.Exists(dest); n++) dest = Path.Combine(outDir, $"{stem} ({n}){ext}");
+                File.Copy(a.Path, dest);
+                // Store blobs are marked read-only; make sure the copy isn't.
+                try { File.SetAttributes(dest, File.GetAttributes(dest) & ~FileAttributes.ReadOnly); } catch { }
+                saved.Add(new Dictionary<string, object>
+                { ["id"] = a.Id, ["messageId"] = a.MessageId, ["from"] = a.Path, ["saved"] = Path.GetFullPath(dest) });
+                if (!Json) Console.WriteLine($"saved [{a.Id}] {baseName} -> {Path.GetFullPath(dest)}");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"attachment {id}: {ex.Message}"); failed++; }
+        }
+        if (Json) Console.WriteLine(JsonSerializer.Serialize(saved));
+        return failed > 0 ? 3 : 0;
     }
 
     // ---- draft: create a server-side draft via the account's provider, so it syncs INTO Mailbird ----
@@ -1041,8 +1296,11 @@ USAGE
   mailbird-cli [<db>] accounts
   mailbird-cli [<db>] folders [accountId]
   mailbird-cli [<db>] search <query...> [--account ID] [--limit N] [--raw]
-  mailbird-cli [<db>] list [--folder NAME] [--account ID] [--from SUBSTR] [--unread] [--days N] [--limit N]
-  mailbird-cli [<db>] read <messageId> [--max CHARS]
+  mailbird-cli [<db>] list [--folder NAME] [--account ID] [--from SUBSTR] [--unread] [--days N]
+                       [--has-attachments] [--limit N]
+  mailbird-cli [<db>] read <messageId> [--max CHARS] [--all] [--json]
+  mailbird-cli [<db>] attachments <messageId> [--all] [--json]
+  mailbird-cli [<db>] attachment save <attachmentId...> [--out DIR] [--json]
   mailbird-cli [<db>] tables | schema <like> | sql <query...>
   (append --json to any read/search command for machine-readable output)
 
@@ -1058,6 +1316,13 @@ USAGE
   draft delete removes a synced draft by its local Id (server-side; Mailbird drops it on next poll).
   signature: optional, off by default. When set via --signature ""..."" (use \n for line breaks) or the
        MAILBIRD_SIGNATURE env var, it is appended after a blank line at the end of the body.
+  ATTACHMENTS: read lists them automatically with the FULL LOCAL PATH of each downloaded file, so you can
+       open/parse it directly — no export step. Files live in the ""A"" folder next to Store.db, one
+       directory per attachment id. Inline cid: images (signature logos etc.) are hidden by default;
+       --all includes them. `downloaded=0` / ""(not downloaded)"" means Mailbird never fetched the blob —
+       there is no local file; open the message in Mailbird to pull it down. list/search show an `att`
+       column counting real attachments; `list --has-attachments` keeps only messages that have some.
+       `attachment save` copies blobs out of the read-only store into a writable folder.
   <db> is optional; defaults to %LOCALAPPDATA%\Mailbird\Store\Store.db (override with MAILBIRD_STORE_DB).
   Read/search open the DB read-only and never write to it.
 
@@ -1067,7 +1332,10 @@ EXAMPLES
   mailbird-cli draft --reply-to 112187 --body ""Thanks — sounds good.""   (reply in the parent's account+thread)
   mailbird-cli search ""invoice overdue"" --limit 10
   mailbird-cli list --folder Inbox --account 4 --unread --limit 20
-  mailbird-cli read 112097
+  mailbird-cli list --has-attachments --days 30        (only messages with real attachments)
+  mailbird-cli read 112097                             (headers + attachment paths + body)
+  mailbird-cli attachments 113846                      (just the attachments, with full paths)
+  mailbird-cli attachment save 40359 40361 --out C:\temp\out
 
 SEARCH SYNTAX (FTS5): plain words = AND; ""quoted phrase""; col:term (Subject/Body/From_/To_/Cc/Bcc);
   AND / OR / NOT; prefix*   (use --raw to pass this syntax through verbatim)");
